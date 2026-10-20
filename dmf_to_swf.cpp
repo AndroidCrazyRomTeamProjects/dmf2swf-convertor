@@ -69,8 +69,19 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cstring>
+#include <cstdlib>
+
+#define SDEFL_IMPLEMENTATION
+#include "sdefl.h"
 
 namespace {
+
+struct ConvertOptions {
+    bool compress_images = false;
+    bool cws_container = false;
+    int compression_level = 6;
+};
 
 constexpr std::size_t kDmfHeaderSize = 120;
 constexpr std::size_t kMovieHeaderStart = 8;
@@ -140,6 +151,87 @@ void zlib_compress_store(const std::vector<std::uint8_t>& in, std::vector<std::u
     out.push_back(static_cast<std::uint8_t>((checksum >> 16) & 0xff));
     out.push_back(static_cast<std::uint8_t>((checksum >> 8) & 0xff));
     out.push_back(static_cast<std::uint8_t>(checksum & 0xff));
+}
+
+// ----------------------------------------------------------------------------
+// Lossless zlib DEFLATE compression using sdefl (RFC 1950 / RFC 1951)
+// ----------------------------------------------------------------------------
+void zlib_compress_deflate(const std::vector<std::uint8_t>& in,
+                           std::vector<std::uint8_t>& out,
+                           int level = 6) {
+    out.clear();
+    if (in.empty()) {
+        zlib_compress_store(in, out);
+        return;
+    }
+
+    std::uint8_t cmf = 0x78;
+    std::uint8_t flg = 0x9c;
+    if (level <= 1) flg = 0x01;
+    else if (level <= 5) flg = 0x5e;
+    else if (level <= 6) flg = 0x9c;
+    else flg = 0xda;
+
+    std::uint16_t hdr_val = (static_cast<std::uint16_t>(cmf) << 8) | flg;
+    flg += static_cast<std::uint8_t>((31 - (hdr_val % 31)) % 31);
+
+    out.push_back(cmf);
+    out.push_back(flg);
+
+    int bound = sdefl_bound(static_cast<int>(in.size()));
+    std::size_t header_size = out.size();
+    out.resize(header_size + bound);
+
+    struct sdefl s;
+    std::memset(&s, 0, sizeof(s));
+    int comp_len = sdeflate(&s, out.data() + header_size, in.data(), static_cast<int>(in.size()), level);
+    if (comp_len <= 0) {
+        zlib_compress_store(in, out);
+        return;
+    }
+    out.resize(header_size + comp_len);
+
+    std::uint32_t checksum = adler32(in.data(), in.size());
+    out.push_back(static_cast<std::uint8_t>((checksum >> 24) & 0xff));
+    out.push_back(static_cast<std::uint8_t>((checksum >> 16) & 0xff));
+    out.push_back(static_cast<std::uint8_t>((checksum >> 8) & 0xff));
+    out.push_back(static_cast<std::uint8_t>(checksum & 0xff));
+}
+
+void zlib_compress(const std::vector<std::uint8_t>& in,
+                   std::vector<std::uint8_t>& out,
+                   bool deflate,
+                   int level = 6) {
+    if (deflate) {
+        zlib_compress_deflate(in, out, level);
+    } else {
+        zlib_compress_store(in, out);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Compress FWS SWF container into CWS SWF container (SWF 6+ specification)
+// ----------------------------------------------------------------------------
+bool compress_swf_to_cws(const std::vector<std::uint8_t>& fws_swf,
+                         std::vector<std::uint8_t>& cws_swf,
+                         int level = 6) {
+    if (fws_swf.size() < 8) return false;
+    cws_swf.clear();
+    cws_swf.push_back('C');
+    cws_swf.push_back('W');
+    cws_swf.push_back('S');
+    cws_swf.push_back(fws_swf[3]); // SWF version
+
+    // Uncompressed file length from FWS header (bytes 4..7)
+    cws_swf.insert(cws_swf.end(), fws_swf.begin() + 4, fws_swf.begin() + 8);
+
+    // Compress SWF body from byte 8 to EOF
+    std::vector<std::uint8_t> body(fws_swf.begin() + 8, fws_swf.end());
+    std::vector<std::uint8_t> compressed_body;
+    zlib_compress_deflate(body, compressed_body, level);
+
+    cws_swf.insert(cws_swf.end(), compressed_body.begin(), compressed_body.end());
+    return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -271,7 +363,9 @@ void write_u32_le(std::vector<std::uint8_t>& output, std::size_t offset, std::ui
 // Convert DMF Tag 570 into standard SWF DefineBitsLossless / DefineBitsLossless2
 // ----------------------------------------------------------------------------
 bool convert_tag_570(const std::uint8_t* tag_data, std::size_t tag_len,
-                     std::vector<std::uint8_t>& swf_tag) {
+                     std::vector<std::uint8_t>& swf_tag,
+                     bool compress_images = false,
+                     int compression_level = 6) {
     if (tag_len < 12) return false;
 
     std::uint16_t char_id = static_cast<std::uint16_t>(tag_data[0]) |
@@ -318,7 +412,7 @@ bool convert_tag_570(const std::uint8_t* tag_data, std::size_t tag_len,
             }
 
             std::vector<std::uint8_t> zlib_data;
-            zlib_compress_store(pix24, zlib_data);
+            zlib_compress(pix24, zlib_data, compress_images, compression_level);
 
             std::vector<std::uint8_t> payload;
             append_u16_le(payload, char_id);
@@ -369,7 +463,7 @@ bool convert_tag_570(const std::uint8_t* tag_data, std::size_t tag_len,
             }
 
             std::vector<std::uint8_t> zlib_data;
-            zlib_compress_store(rgba32, zlib_data);
+            zlib_compress(rgba32, zlib_data, compress_images, compression_level);
 
             std::vector<std::uint8_t> payload;
             append_u16_le(payload, char_id);
@@ -442,7 +536,7 @@ bool convert_tag_570(const std::uint8_t* tag_data, std::size_t tag_len,
         }
 
         std::vector<std::uint8_t> zlib_data;
-        zlib_compress_store(rgba32, zlib_data);
+        zlib_compress(rgba32, zlib_data, compress_images, compression_level);
 
         std::vector<std::uint8_t> payload;
         append_u16_le(payload, char_id);
@@ -515,7 +609,8 @@ bool write_file(const std::string& path,
 // Full DMF to SWF Conversion
 // ----------------------------------------------------------------------------
 bool convert_dmf_to_swf(const std::vector<std::uint8_t>& dmf,
-                        std::vector<std::uint8_t>& swf) {
+                        std::vector<std::uint8_t>& swf,
+                        const ConvertOptions& options) {
     if (dmf.size() < kDmfHeaderSize) {
         std::cerr << "error: DMF is shorter than its 120-byte header\n";
         return false;
@@ -573,7 +668,7 @@ bool convert_dmf_to_swf(const std::vector<std::uint8_t>& dmf,
         if (tag_type == 570) {
             // Convert proprietary DMF tag 570 to standard SWF DefineBitsLossless(2)
             std::vector<std::uint8_t> converted_tag;
-            if (convert_tag_570(tag_payload, tag_len, converted_tag)) {
+            if (convert_tag_570(tag_payload, tag_len, converted_tag, options.compress_images, options.compression_level)) {
                 swf.insert(swf.end(), converted_tag.begin(), converted_tag.end());
                 converted_images++;
             } else {
@@ -592,27 +687,101 @@ bool convert_dmf_to_swf(const std::vector<std::uint8_t>& dmf,
     // Write final SWF file length into header (offset 4)
     write_u32_le(swf, 4, static_cast<std::uint32_t>(swf.size()));
 
+    if (options.cws_container) {
+        std::vector<std::uint8_t> cws;
+        if (compress_swf_to_cws(swf, cws, options.compression_level)) {
+            swf = std::move(cws);
+        } else {
+            std::cerr << "error: failed to apply CWS container compression\n";
+            return false;
+        }
+    }
+
     std::cout << "Successfully converted " << tag_count << " tags ("
               << converted_images << " images converted with corrected colors)\n";
     return true;
 }
 
+void print_usage(const char* prog) {
+    std::cout << "Usage: " << prog << " [options] <input.dmf> <output.swf>\n\n"
+              << "Converts LG proprietary DMF files into standard SWF format.\n\n"
+              << "Options:\n"
+              << "  --compress, -c         Enable lossless DEFLATE compression on images.\n"
+              << "                         (Matches original LGUI output, reduces ~1.5MB to ~150KB)\n"
+              << "  --cws                  Compress the entire SWF container to CWS format.\n"
+              << "                         (Reduces SWF further to ~123KB, matching compressed DMF)\n"
+              << "  --compress-all         Enable both image DEFLATE and CWS container compression.\n"
+              << "  --level <1-9>          Set compression level (default: 6).\n"
+              << "  -h, --help             Show this help message.\n\n"
+              << "Examples:\n"
+              << "  " << prog << " input.dmf output.swf\n"
+              << "  " << prog << " --compress input.dmf output.swf\n"
+              << "  " << prog << " -c --cws input.dmf output.swf\n";
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "usage: dmf_to_swf <input.dmf> <output.swf>\n";
+    ConvertOptions options;
+    std::string input_path;
+    std::string output_path;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg == "--compress" || arg == "-c") {
+            options.compress_images = true;
+        } else if (arg == "--cws") {
+            options.cws_container = true;
+        } else if (arg == "--compress-all" || arg == "--all") {
+            options.compress_images = true;
+            options.cws_container = true;
+        } else if (arg == "--level" && i + 1 < argc) {
+            int lvl = std::atoi(argv[++i]);
+            options.compression_level = std::max(1, std::min(9, lvl));
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "error: unknown option: " << arg << "\n";
+            print_usage(argv[0]);
+            return 2;
+        } else {
+            if (input_path.empty()) {
+                input_path = arg;
+            } else if (output_path.empty()) {
+                output_path = arg;
+            } else {
+                std::cerr << "error: unexpected extra argument: " << arg << "\n";
+                print_usage(argv[0]);
+                return 2;
+            }
+        }
+    }
+
+    if (input_path.empty() || output_path.empty()) {
+        std::cerr << "error: missing input or output file path\n\n";
+        print_usage(argv[0]);
         return 2;
     }
 
     std::vector<std::uint8_t> dmf;
     std::vector<std::uint8_t> swf;
-    if (!read_file(argv[1], dmf) || !convert_dmf_to_swf(dmf, swf) ||
-        !write_file(argv[2], swf)) {
+    if (!read_file(input_path, dmf) || !convert_dmf_to_swf(dmf, swf, options) ||
+        !write_file(output_path, swf)) {
         return 1;
     }
 
     std::cout << "converted " << dmf.size() << " bytes to " << swf.size()
-              << " bytes\n";
+              << " bytes";
+    if (options.cws_container && options.compress_images) {
+        std::cout << " (DEFLATE images + CWS container compression active)";
+    } else if (options.cws_container) {
+        std::cout << " (CWS container compression active)";
+    } else if (options.compress_images) {
+        std::cout << " (lossless DEFLATE image compression active)";
+    } else {
+        std::cout << " (uncompressed stored blocks; use --compress to shrink to ~150KB)";
+    }
+    std::cout << "\n";
     return 0;
 }
