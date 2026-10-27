@@ -555,6 +555,61 @@ bool convert_tag_570(const std::uint8_t* tag_data, std::size_t tag_len,
         }
         swf_tag.insert(swf_tag.end(), payload.begin(), payload.end());
         return true;
+    } else if (method == 2 && format == 0) {
+        // Method 2, Format 0: Indexed RGB565 Palette without alpha -> Tag 20 (DefineBitsLossless), format 5 (PIX24)
+        std::size_t num_colors = static_cast<std::size_t>(byte11) + 1;
+        std::size_t pal_bytes = num_colors * 2;
+        if (raw_pixels.size() < pal_bytes + pixel_count) {
+            std::cerr << "error: indexed image buffer too short for character " << char_id << "\n";
+            return false;
+        }
+
+        struct ColorRGB {
+            std::uint8_t r, g, b;
+        };
+        std::vector<ColorRGB> palette(num_colors);
+        for (std::size_t i = 0; i < num_colors; ++i) {
+            std::uint8_t b0 = raw_pixels[i * 2 + 0];
+            std::uint8_t b1 = raw_pixels[i * 2 + 1];
+
+            std::uint8_t r = b0 & 0xf8;
+            std::uint8_t g = ((b0 << 5) & 0xe0) | ((b1 >> 3) & 0x1c);
+            std::uint8_t b = (b1 << 3) & 0xf8;
+
+            palette[i] = {r, g, b};
+        }
+
+        const std::uint8_t* indices = raw_pixels.data() + pal_bytes;
+        std::vector<std::uint8_t> pix24(pixel_count * 4);
+        for (std::size_t p = 0; p < pixel_count; ++p) {
+            std::uint8_t idx = indices[p];
+            const ColorRGB& c = palette[idx];
+            pix24[p * 4 + 0] = 0; // Reserved
+            pix24[p * 4 + 1] = c.r;
+            pix24[p * 4 + 2] = c.g;
+            pix24[p * 4 + 3] = c.b;
+        }
+
+        std::vector<std::uint8_t> zlib_data;
+        zlib_compress(pix24, zlib_data, compress_images, compression_level);
+
+        std::vector<std::uint8_t> payload;
+        append_u16_le(payload, char_id);
+        payload.push_back(5); // Format 5 (24-bit RGB)
+        append_u16_le(payload, width);
+        append_u16_le(payload, height);
+        payload.insert(payload.end(), zlib_data.begin(), zlib_data.end());
+
+        // Build Tag 20 header
+        std::uint16_t tag_type = 20;
+        if (payload.size() >= 0x3f) {
+            append_u16_le(swf_tag, (tag_type << 6) | 0x3f);
+            append_u32_le(swf_tag, static_cast<std::uint32_t>(payload.size()));
+        } else {
+            append_u16_le(swf_tag, (tag_type << 6) | static_cast<std::uint16_t>(payload.size()));
+        }
+        swf_tag.insert(swf_tag.end(), payload.begin(), payload.end());
+        return true;
     }
 
     std::cerr << "error: unsupported method (" << static_cast<int>(method)
